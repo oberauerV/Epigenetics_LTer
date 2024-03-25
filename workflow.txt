@@ -1,0 +1,72 @@
+### Workflow
+### Assumptions:
+### All samples are paired-end reads
+### Text file with list of samples (and conditions if needed)
+### Quality assesment can be done after each step
+### it is advised to change filenames to something meaningfull, especialy for the read data
+
+## Adapter removal and Quality trimming using trim-galore v0.6.10
+
+while read line; do
+    sample=$(echo $line|awk '{print $2}')
+    trim_galore --cores 20 --paired -o noclip --no_report_file sample/"$sample".R1.fq.gz sample/"$sample".R2.fq.gz
+done <samples
+
+## genome preperation using Bismark v.0.24.1
+
+bismark_genome_preparation genome/ #directory containing reference genome
+
+## First aligment round using bismark
+## opional: generate text file for containing the samples for each condition
+
+while read line; do
+    sample=$(echo $line|awk '{print $2}')
+    condition=$(echo $line|awk '{print $3}')
+    bismark -o bismark_"$condition" --multicore 22 -un --score_min L,0,-0.6 --genome genome/ -1 noclip/"$sample".1.fq.gz -2 noclip/"$sample".2.fq.gz
+done <samples
+
+# move unmapped reads to seperate directory
+mv bismark_condition/*unmapped* unmapped/
+
+# in each condition directroy generate M-Bias plots to identify ingore statments in methylation extractor manually
+export PERL5LIB=/lisc/user/oberauer/perl5/lib/perl5:$PERL5LIB #perl module GD::Graph needed
+bismark_methylation_extractor --parallel 28 --mbias_only *.bam
+
+## Clip unmapped reads using TrimGalore
+
+while read line; do
+    sample=$(echo $line|awk '{print $2}')
+    trim_galore --cores 30 --paired --clip_R1 10 --clip_R2 10 --three_prime_clip_R1 10 --three_prime_clip_R2 10 -o clip --no_report_file unmapped/"$sample".1*fq.gz unmapped/"$sample".2*fq.gz
+done <samples
+
+## Aligment of trimmed reads
+
+while read line; do
+    sample=$(echo $line|awk '{print $2}')
+    bismark -o bismark_clipped --multicore 22 --score_min L,0,-0.6 --genome genome/ -1 clip/"$sample".1_clip.fq.gz -2 clip/"$sample".2_clip.fq.gz
+done <samples
+
+## Combine aligments and deduplication
+
+while read line; do
+        sample=$(echo $line|awk '{print $2}')
+        dir=$(echo $line|awk '{print $3}')
+        deduplicate_bismark --multiple --output_dir 2_dedup/ bismark_"$dir"/"$sample"_pe.bam bismark_clipped/"$sample"_clip_pe.bam
+done <samples
+
+## Methylation extraction (.cov.gz file for dss input)
+# when including ingnore statements, manually check M-Bias
+# CpG_context and Non_CpG_context are not needed in our analyisis, removed for space reasons
+while read line; do
+        sample=$(echo $line|awk '{print $2}')
+        bismark_methylation_extractor --parallel 28 --bedGraph --comprehensive --merge_non_CpG --ignore 5 --ignore_3prime 3 --ignore_r2 5 --ignore_3prime_r2 3 dedup/"$sample"_pe.multiple.deduplicated.bam
+        rm CpG_context_"$sample"_pe.multiple.deduplicated.txt Non_CpG_context_"$sample"_pe.multiple.deduplicated.txt  "$sample"_pe.multiple.deduplicated.bedGraph.gz "$sample"_pe.multiple.deduplicated.M-bias.txt "$sample"_pe.multiple.deduplicated_splitting_report.txt
+done <samples
+
+##generate dss input filenames
+
+gunzip *.cov.gz
+while read line; do
+    sample=$(echo $line|awk '{print $2}')
+    awk '{print $1, $2, $5 + $6, $5}' "$sample".cov > "$sample".tsv  
+done <samples
